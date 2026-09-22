@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Generated media
+inputs/*.mp4
+inputs/*.mkv
+inputs/*.y4m
+inputs/*.raw
+
+# Experiment outputs
+runs/*
+!runs/.gitkeep
+results/*
+!results/.gitkeep
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
