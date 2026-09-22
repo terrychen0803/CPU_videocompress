@@ -6,6 +6,23 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 
+find_nsys() {
+  if [[ -n "${NSYS_BIN:-}" && -x "${NSYS_BIN}" ]]; then
+    printf '%s\n' "${NSYS_BIN}"
+    return 0
+  fi
+  if command -v nsys >/dev/null 2>&1; then
+    command -v nsys
+    return 0
+  fi
+  local known="/opt/nvidia/nsight-systems-cli/2026.4.1/target-linux-x64/nsys"
+  if [[ -x "$known" ]]; then
+    printf '%s\n' "$known"
+    return 0
+  fi
+  return 1
+}
+
 DEVICE="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="$ROOT/runs/$DEVICE/environment"
@@ -13,6 +30,7 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 mkdir -p "$OUT_DIR"
 OUT="$OUT_DIR/environment_${STAMP}.txt"
+NSYS="$(find_nsys || true)"
 
 {
   echo "# CPU Video Compression Experiment Environment"
@@ -36,16 +54,24 @@ OUT="$OUT_DIR/environment_${STAMP}.txt"
   ffmpeg -version
   echo
 
-  echo "## perf"
-  perf --version
-  echo
-
   echo "## python"
   python3 --version
   echo
 
   echo "## perf_event_paranoid"
   cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true
+  echo
+
+  echo "## Nsight Systems"
+  if [[ -n "$NSYS" ]]; then
+    echo "nsys_path=$NSYS"
+    "$NSYS" --version 2>&1 || true
+    echo
+    echo "### nsys status --environment"
+    "$NSYS" status --environment 2>&1 || true
+  else
+    echo "Nsight Systems CLI not found"
+  fi
   echo
 
   echo "## CPU frequency governors"
@@ -74,6 +100,12 @@ OUT="$OUT_DIR/environment_${STAMP}.txt"
 
 if lscpu -J >/dev/null 2>&1; then
   lscpu -J > "$OUT_DIR/lscpu_${STAMP}.json"
+fi
+
+if [[ -n "$NSYS" ]]; then
+  "$NSYS" profile --cpu-core-events=help > "$OUT_DIR/nsys_cpu_core_events_${STAMP}.txt" 2>&1 || true
+  "$NSYS" profile --os-events=help > "$OUT_DIR/nsys_os_events_${STAMP}.txt" 2>&1 || true
+  "$NSYS" profile --cpu-metrics=help > "$OUT_DIR/nsys_cpu_metrics_help_${STAMP}.txt" 2>&1 || true
 fi
 
 cp "$OUT" "$OUT_DIR/environment_latest.txt"
