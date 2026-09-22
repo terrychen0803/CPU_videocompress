@@ -1,33 +1,69 @@
 # Analysis plan
 
-The collection pipeline is implemented first. Feature extraction and modeling should be added only after validating the raw `perf.csv` format on both CPU nodes.
+The primary dry-run source is now **Nsight Systems**. Feature extraction should be implemented only after validating the actual `profile.sqlite` schema and event availability on both CPU nodes.
+
+## Raw data sources
+
+Each dry-run collection should retain:
+
+```text
+profile.nsys-rep     <- canonical Nsight Systems report
+profile.sqlite       <- machine-readable export
+metadata.json        <- workload + collection settings
+ffmpeg.log           <- application log, oracle/debug only
+```
+
+The `.nsys-rep` file is the canonical raw artifact. SQLite is used for research feature extraction.
+
+CPU hardware event sampling is system-wide. Process-tree scheduling/context-switch data is separate. Keep the pilot nodes otherwise quiet when interpreting CPU event rates as workload behavior.
 
 ## Feature families
 
-### A. Aggregate features
+### A. Core CPU behavior
 
-- task-clock mean / median
-- cycles mean
-- instructions mean
-- IPC = instructions / cycles
-- branch miss rate = branch-misses / branches
-- cache miss rate = cache-misses / cache-references
+Common target signals:
 
-### B. Temporal features
+- CPU Cycles
+- Instructions Retired
+- IPC = Instructions / Cycles
+- FFmpeg process-tree scheduling activity
+- context-switch behavior
 
-After removing warm-up:
+Additional branch/cache/OS events are used only when `nsys profile --cpu-core-events=help` or `--os-events=help` confirms support on the target CPU.
+
+### B. Aggregate features
+
+For each collected signal after warm-up removal:
 
 - mean
+- median
 - standard deviation
 - P10 / P50 / P90
+- min / max
 - coefficient of variation
+
+Derived ratios, when both source signals are valid:
+
+```text
+IPC = instructions / cycles
+branch_miss_rate = branch_misses / branches
+cache_miss_rate = cache_misses / cache_references
+```
+
+Do not synthesize unsupported counters as zero. Missing/unsupported signals should be marked unavailable.
+
+### C. Temporal features
+
 - trend / slope
-- peak
-- burstiness / active fraction where meaningful
+- window-to-window variance
+- peak activity
+- burstiness
+- active fraction
+- scheduling stability
 
-### C. Periodic / spectral features
+### D. Periodic / spectral features
 
-These are experimental rather than assumed:
+These are experimental, not assumed:
 
 - autocorrelation peaks
 - dominant period
@@ -45,19 +81,38 @@ vs.
 Aggregate + Temporal + Periodic
 ```
 
-This directly tests whether periodic features add predictive value for FFmpeg CPU encoding.
+The objective is to test whether marker-free periodic features improve FFmpeg performance prediction.
 
 ## Ground truth
 
-Use only `baseline_summary.json` from no-profiler runs.
+Use only `baseline_summary.json` generated from no-profiler runs.
 
 Primary labels:
 
 - median full encoding runtime
 - median encoding FPS
 
-Profiler-inflated runtime must not be used as ground truth.
+Nsight Systems profiled runtime must not be used as ground truth.
+
+## Warm-up
+
+The default dry run records 35 seconds and marks the first 5 seconds as warm-up.
+
+Feature extraction should use only the post-warm-up region.
+
+## Inspect the real SQLite schema first
+
+Nsight Systems export schemas can differ by release and collection configuration.
+
+After collecting C01:
+
+```bash
+python analysis/inspect_nsys_sqlite.py \
+  runs/<DEVICE>/C01/dryrun_nsys_01/profile.sqlite
+```
+
+Use the resulting table/column inventory to implement the final time-series extractor rather than hard-coding an old Nsight Systems SQLite schema.
 
 ## Oracle/application logs
 
-FFmpeg progress information may be used for offline validation, but application-derived frame/FPS markers should not be required by the production feature pipeline if the goal remains marker-free profiling.
+FFmpeg frame/FPS progress can be used for offline validation only. It should not be required by the production feature pipeline if the objective remains marker-free profiling.
