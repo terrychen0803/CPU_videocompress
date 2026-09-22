@@ -2,16 +2,16 @@
 
 This repository contains the first-stage data collection pipeline for the **CPU Compute-Bound** workload in the Pre-6G runtime/resource prediction study.
 
-The representative workload is **FFmpeg software video encoding** using `libx264` and `libx265`. The research workflow follows the same high-level idea used in the GPU workload experiments:
+The representative workload is **FFmpeg software video encoding** using `libx264` and `libx265`. The primary profiler is now **NVIDIA Nsight Systems (`nsys`)**, so the CPU experiment follows the same tooling philosophy as the existing GPU workload experiments:
 
 ```text
 Workload configuration
         |
         +--> Full baseline run (no profiler)
-        |       -> Ground truth runtime / encoding FPS
+        |       -> ground-truth runtime / encoding FPS
         |
-        +--> Short marker-free CPU profiling run
-                -> perf counter time series
+        +--> Short marker-free Nsight Systems run
+                -> CPU event time series + scheduling activity
                 -> behavior / temporal / periodic features
                 -> runtime/FPS prediction
 ```
@@ -30,7 +30,7 @@ This gives:
 3 resolutions x 2 codecs x 3 presets = 18 workloads
 ```
 
-Fixed parameters for the first stage:
+Fixed parameters:
 
 - FPS: 30
 - CRF: 23
@@ -38,37 +38,85 @@ Fixed parameters for the first stage:
 - Threads: FFmpeg/encoder default
 - Pixel format: yuv420p
 
-The workload definitions are stored in `workloads/workloads.csv`.
+Definitions are stored in `workloads/workloads.csv`.
 
 ## 2. Repository structure
 
 ```text
 CPU_videocompress/
-├── inputs/                     # generated input videos (not committed)
+├── inputs/                       # generated input videos (not committed)
 ├── workloads/
 │   └── workloads.csv
 ├── scripts/
 │   ├── check_prerequisites.sh
+│   ├── discover_nsys_cpu.sh
 │   ├── generate_inputs.sh
 │   ├── collect_environment.sh
 │   ├── run_baseline.py
-│   └── run_dryrun_perf.py
+│   ├── run_dryrun_nsys.py        # PRIMARY dry-run collector
+│   └── run_dryrun_perf.py        # legacy/reference collector only
 ├── analysis/
-│   └── README.md
-├── runs/                       # experiment outputs (not committed)
-├── results/                    # analysis outputs (not committed)
+│   ├── README.md
+│   └── inspect_nsys_sqlite.py
+├── runs/
+├── results/
 ├── requirements.txt
 └── .gitignore
 ```
 
-## 3. Prerequisites
+## 3. Why Nsight Systems can be used for the CPU experiment
+
+On Linux, Nsight Systems uses the Linux perf subsystem for CPU profiling. The useful collection modes for this project are:
+
+- CPU hardware event sampling: CPU cycles, instructions retired, and additional branch/cache events when supported by the target CPU.
+- CPU context-switch tracing: scheduling activity for the FFmpeg process tree.
+- Optional CPU IP/backtrace sampling for function-level analysis.
+- OS events when exposed by the target platform.
+
+The exact event list is **CPU dependent**. Intel and AMD systems must therefore be queried on each node before the full experiment.
+
+For the first cross-CPU pilot, the primary common event pair is:
+
+```text
+CPU Cycles
+Instructions Retired
+```
+
+which supports:
+
+```text
+IPC = Instructions Retired / CPU Cycles
+```
+
+Branch, branch-miss, cache-reference, cache-miss, page-fault, and frequency-related signals are added only when Nsight Systems reports them as supported on that node.
+
+### Important limitation
+
+Nsight Systems CPU hardware event sampling is collected **system-wide across CPU cores**, not directly attributed to an individual process/thread. Process-tree context-switch tracing is collected separately.
+
+Therefore the first workload-characterization experiments should run on an otherwise quiet node. Later experiments with background loading can intentionally treat the system-wide signals as node-state features.
+
+## 4. Prerequisites
 
 Ubuntu/Linux is assumed.
 
+FFmpeg:
+
 ```bash
 sudo apt update
-sudo apt install ffmpeg linux-tools-common linux-tools-generic
-sudo apt install linux-tools-$(uname -r)
+sudo apt install ffmpeg
+```
+
+Nsight Systems must already be installed. The scripts search in this order:
+
+1. `NSYS_BIN` environment variable
+2. `nsys` in `PATH`
+3. `/opt/nvidia/nsight-systems-cli/2026.4.1/target-linux-x64/nsys`
+
+For the known 2026.4.1 installation:
+
+```bash
+export NSYS_BIN=/opt/nvidia/nsight-systems-cli/2026.4.1/target-linux-x64/nsys
 ```
 
 Create the Python environment:
@@ -85,15 +133,44 @@ Check the node:
 bash scripts/check_prerequisites.sh
 ```
 
-A quick perf permission test is also included. If perf reports a permission error, inspect:
+For system-wide hardware event sampling, Linux permissions usually need:
 
 ```bash
 cat /proc/sys/kernel/perf_event_paranoid
 ```
 
-## 4. Generate pilot input videos
+to be `0` or lower, or equivalent privileges. Do not start the full dataset until `nsys status --environment` and a C01 dry run both succeed.
 
-For initial pipeline validation, generate a deterministic FFmpeg `testsrc2` video set.
+## 5. Discover CPU events on each node
+
+Run once per CPU node:
+
+```bash
+bash scripts/discover_nsys_cpu.sh Intel_i7_13700K
+```
+
+or:
+
+```bash
+bash scripts/discover_nsys_cpu.sh Ryzen_9950X
+```
+
+The output is saved under:
+
+```text
+runs/<DEVICE>/environment/nsys_discovery/
+├── nsys_version.txt
+├── nsys_status_environment.txt
+├── cpu_core_events.txt
+├── os_events.txt
+└── cpu_metrics_help.txt
+```
+
+Inspect `cpu_core_events.txt` before choosing additional events. Event IDs and availability can differ between Intel and AMD.
+
+The default collector uses `1,2` as the initial CPU Cycles + Instructions Retired pair. Verify those IDs in the discovery output on every node before large-scale collection.
+
+## 6. Generate pilot input videos
 
 Default duration is 60 seconds:
 
@@ -101,7 +178,7 @@ Default duration is 60 seconds:
 bash scripts/generate_inputs.sh
 ```
 
-Or choose another duration, for example 300 seconds:
+For a 300-second source:
 
 ```bash
 bash scripts/generate_inputs.sh 300
@@ -115,11 +192,9 @@ inputs/input_1440p.mp4
 inputs/input_4k.mp4
 ```
 
-These files are intentionally ignored by git.
+The three files contain the same synthetic `testsrc2` content at different resolutions. Scaling is completed before the benchmark, so resize work is not included in the measured encoding run.
 
-> Note: the pilot source is H.264-compressed, so the measured application includes input decoding plus software encoding. This is acceptable for pipeline validation and end-to-end video compression benchmarking. If a later experiment needs to isolate encoder-only cost, use a raw/lossless source and account for the much larger storage requirement.
-
-## 5. Record each CPU node environment
+## 7. Record each CPU node environment
 
 Run once on each node:
 
@@ -127,33 +202,13 @@ Run once on each node:
 bash scripts/collect_environment.sh Intel_i7_13700K
 ```
 
-or:
+The environment record includes CPU, RAM, kernel, FFmpeg, Nsight Systems version/status, CPU event discovery, frequency-governor information, and storage metadata.
 
-```bash
-bash scripts/collect_environment.sh Ryzen_9950X
-```
+## 8. Ground-truth baseline collection
 
-The script stores CPU, memory, kernel, FFmpeg, perf, frequency-governor, and storage information under:
+Baseline runs must not use Nsight Systems or any other profiler.
 
-```text
-runs/<DEVICE>/environment/
-```
-
-## 6. Ground-truth baseline collection
-
-Baseline runs must **not** use perf/profiling.
-
-Run all 18 workloads with three repeats:
-
-```bash
-source .venv/bin/activate
-
-python scripts/run_baseline.py \
-  --device Intel_i7_13700K \
-  --repeats 3
-```
-
-Test only C01 first:
+Test C01 first:
 
 ```bash
 python scripts/run_baseline.py \
@@ -162,116 +217,156 @@ python scripts/run_baseline.py \
   --only C01
 ```
 
-Each run stores:
+Then run all 18:
+
+```bash
+python scripts/run_baseline.py \
+  --device Intel_i7_13700K \
+  --repeats 3
+```
+
+Each workload receives:
 
 ```text
 runs/<DEVICE>/<WORKLOAD>/baseline_XX/
 ├── ffmpeg.log
 └── summary.json
-```
 
-and each workload receives:
-
-```text
 runs/<DEVICE>/<WORKLOAD>/baseline_summary.json
 ```
 
-with median runtime and median encoding FPS.
+Ground truth is the median of the successful no-profiler runs.
 
-## 7. Short CPU dry-run profiling
+## 9. Primary dry run: Nsight Systems
 
-The first-stage profiler uses Linux `perf stat` with interval sampling.
+Default pilot settings:
 
-Default settings:
+- total profiling window: 35 s
+- first 5 s marked as warm-up for later exclusion
+- CPU event sampling interval: 100 ms
+- context-switch scope: FFmpeg process tree
+- CPU IP sampling: disabled by default to reduce overhead
+- input looped so fast configurations do not terminate before the collection window
+- CPU core events: `1,2` by default, subject to per-node verification
+- output: `.nsys-rep` + SQLite export
 
-- interval: 100 ms
-- wall-clock profiling window: 35 s
-- warm-up portion excluded later: first 5 s
-- input is looped during the profiling run so fast encoders do not terminate before the profiling window
-
-Example:
+Run C01:
 
 ```bash
-python scripts/run_dryrun_perf.py \
+python scripts/run_dryrun_nsys.py \
   --device Intel_i7_13700K \
   --only C01
 ```
 
-Run all workloads:
+If discovery shows additional event IDs that are supported and can be sampled together:
 
 ```bash
-python scripts/run_dryrun_perf.py \
-  --device Intel_i7_13700K
+python scripts/run_dryrun_nsys.py \
+  --device Intel_i7_13700K \
+  --only C01 \
+  --cpu-core-events 1,2,<branch-id>,<branch-miss-id>
 ```
 
-Raw counters include:
-
-- task-clock
-- cycles
-- instructions
-- branches
-- branch-misses
-- cache-references
-- cache-misses
-- context-switches
-- page-faults
+Do not guess event IDs; use the discovery output.
 
 Outputs:
 
 ```text
-runs/<DEVICE>/<WORKLOAD>/dryrun_perf_01/
-├── perf.csv
+runs/<DEVICE>/<WORKLOAD>/dryrun_nsys_01/
+├── profile.nsys-rep
+├── profile.sqlite
 ├── ffmpeg.log
 └── metadata.json
 ```
 
-## 8. Planned feature analysis
+The SQLite schema can vary with Nsight Systems versions, so inspect the actual C01 export before implementing the final feature extractor:
 
-Do **not** assume that FFmpeg has the same clean single iteration period as YOLO training.
+```bash
+python analysis/inspect_nsys_sqlite.py \
+  runs/Intel_i7_13700K/C01/dryrun_nsys_01/profile.sqlite
+```
 
-The planned ablation is:
+## 10. Candidate features
 
-1. Aggregate CPU counter features
-2. Aggregate + temporal features
-3. Aggregate + temporal + periodic/spectral features
+The feature hierarchy is intentionally similar to the GPU project but does not assume that video encoding has a clean YOLO-like iteration period.
 
-Candidate derived features:
+### Core behavior
 
 ```text
-IPC = instructions / cycles
-branch_miss_rate = branch-misses / branches
-cache_miss_rate = cache-misses / cache-references
+CPU cycles rate
+instructions-retired rate
+IPC
+CPU scheduling / utilization behavior
+context-switch behavior
+```
 
-mean / std / P10 / P50 / P90 / CV / trend
+### Additional node-supported events
+
+When available:
+
+```text
+branches
+branch misses
+cache references
+cache misses
+page faults / selected OS events
+frequency-related events or metrics
+```
+
+### Temporal features
+
+For each time series after removing warm-up:
+
+```text
+mean
+std
+P10 / P50 / P90
+coefficient of variation
+trend
+peak
+burstiness
+```
+
+### Periodic/spectral features
+
+Experimental:
+
+```text
 autocorrelation peak
 dominant period
-FFT dominant frequency
 period confidence
+FFT dominant frequency
+spectral concentration
 ```
 
-This allows the study to test whether marker-free periodic behavior actually improves CPU video-encoding runtime prediction, rather than assuming that it must.
-
-## 9. Recommended execution order
+The planned ablation remains:
 
 ```text
-1. check_prerequisites.sh
-2. generate_inputs.sh
-3. collect_environment.sh
-4. C01 baseline x3
-5. C01 dry-run perf
-6. inspect summary.json / perf.csv
-7. collect C01-C18 on node A
-8. repeat on node B
-9. feature extraction and periodicity analysis
-10. runtime/FPS prediction
+Aggregate
+vs.
+Aggregate + Temporal
+vs.
+Aggregate + Temporal + Periodic
 ```
 
-## 10. Next dataset expansion
+The purpose is to test whether a marker-free periodic signature helps CPU encoding prediction, not to assume that one must exist.
 
-After the 18-workload pilot is stable, add real video contents with different complexity:
+## 11. Recommended execution order
 
-- low motion
-- medium motion
-- high motion / high detail
+```text
+1. git pull
+2. check_prerequisites.sh
+3. discover_nsys_cpu.sh <DEVICE>
+4. generate_inputs.sh 60
+5. collect_environment.sh <DEVICE>
+6. C01 baseline x3
+7. C01 Nsight Systems dry run
+8. inspect profile.nsys-rep / profile.sqlite
+9. confirm event availability and overhead
+10. collect C01-C18 on node A
+11. repeat on node B
+12. implement feature extraction / period analysis
+13. runtime/FPS prediction
+```
 
-The expanded dataset can then test whether the predictor generalizes across unseen video content rather than only across resolution/codec/preset configurations.
+Do not collect all 18 workloads until C01 has produced a valid `.nsys-rep`, SQLite export, and useful CPU event time series.
